@@ -1,0 +1,868 @@
+// This Pine Script® code is subject to the Mozilla Public License 2.0.
+// https://mozilla.org/MPL/2.0/  © OutsizedAlpha
+//@version=6
+indicator("OutsizedAlpha TD Sequential & Combo — reviewed", shorttitle="OA TD S/C", overlay=true, max_labels_count=500, max_lines_count=200)
+
+// Independent implementation of specified published rules, not licensed DeMARK code.
+// Not certified as identical to Symbolik, Bloomberg or DeMARK 9-13.
+// Rule sources and implementation boundaries are recorded at the end of this file.
+
+// ── Display ──────────────────────────────────────────────────────────────────
+string displayGroup = "Display Options"
+bool showSetup = input.bool(true, "Show Setup Counts (1–9)", group=displayGroup)
+bool showCountdown = input.bool(true, "Show Countdown Counts", group=displayGroup)
+bool showOnlyCompletion = input.bool(false, "Show Only Completion Signals", group=displayGroup)
+bool showNewCountStarts = input.bool(true, "Also Show Count Starts (1s)", group=displayGroup, tooltip="In completion-only mode, show the first count. Starts belonging to cancelled series are removed.")
+bool showCurrentSetupProgress = input.bool(true, "Show Current Setup Progress", group=displayGroup)
+bool showCurrentSeqProgress = input.bool(true, "Show Current Sequential Progress", group=displayGroup)
+bool showCurrentComboProgress = input.bool(true, "Show Current Combo Progress", group=displayGroup)
+bool showSequential = input.bool(true, "Show Sequential Countdown", group=displayGroup)
+bool showCombo = input.bool(true, "Show Combo Countdown", group=displayGroup)
+bool showPerfection = input.bool(true, "Show Setup Perfection Arrows", group=displayGroup)
+bool showDeferred = input.bool(true, "Show Deferred Countdown +", group=displayGroup)
+bool showRiskLevel = input.bool(false, "Show Latest Sequential Risk References", group=displayGroup, tooltip="Uses every bar from actual Sequential count 1 through accepted 13. These are reference prices, without an automated qualified stop-out engine.")
+bool showInfoTable = input.bool(true, "Show Status / Live TDST Table", group=displayGroup)
+int historyLabelBudget = input.int(280, "Historical Label Budget", minval=30, maxval=330, group=displayGroup, tooltip="Drawing limit only. Older historical labels may be removed; their calculations and TDST records remain intact.")
+
+// ── Styling ──────────────────────────────────────────────────────────────────
+string styleGroup = "Styling"
+string setupSize = input.string("normal", "Setup Count Size", options=["tiny", "small", "normal", "large", "huge", "auto"], group=styleGroup)
+string countdownSize = input.string("small", "Countdown Count Size", options=["tiny", "small", "normal", "large", "huge", "auto"], group=styleGroup)
+string completionSize = input.string("large", "Completion Size", options=["tiny", "small", "normal", "large", "huge", "auto"], group=styleGroup)
+color sellSetupColor = input.color(color.red, "Sell Setup Colour", group=styleGroup)
+color buySetupColor = input.color(color.green, "Buy Setup Colour", group=styleGroup)
+color sellCountdownColor = input.color(color.new(color.red, 20), "Sell Sequential Colour", group=styleGroup)
+color buyCountdownColor = input.color(color.new(color.green, 20), "Buy Sequential Colour", group=styleGroup)
+color comboSellColor = input.color(color.orange, "Sell Combo Colour", group=styleGroup)
+color comboBuyColor = input.color(color.teal, "Buy Combo Colour", group=styleGroup)
+color tdstSupportColor = input.color(color.new(color.green, 25), "TDST Support Colour", group=styleGroup)
+color tdstResistanceColor = input.color(color.new(color.red, 25), "TDST Resistance Colour", group=styleGroup)
+color perfectionColor = input.color(color.yellow, "Perfection Colour", group=styleGroup)
+
+// ── Explicit rule choices ─────────────────────────────────────────────────────
+string ruleGroup = "Sequential / Setup Rules"
+bool strictPriceFlip = input.bool(true, "Require Strict Opposite Price Flip", group=ruleGroup, tooltip="ON: the previous close must be strictly on the opposite side of its four-bar comparison. OFF: previous equality also permits a flip, as in the original script.")
+bool perfectionAllowsEqual = input.bool(true, "Allow Equal Extremes for Perfection", group=ruleGroup, tooltip="Inclusive legacy convention. Disable for the strict wording of the current DeMARK 9-13 description. Deferred perfection is checked on later confirmed bars.")
+bool enableTDSTCancellation = input.bool(true, "Cancel Countdown Beyond Its Own TDST", group=ruleGroup, tooltip="Buy: TRUE LOW above originating resistance. Sell: TRUE HIGH below originating support. Independent of whether TDST lines are displayed.")
+bool require13vs8 = input.bool(true, "Require Sequential 13 vs 8", group=ruleGroup)
+bool require8vs5 = input.bool(false, "Require Sequential 8 vs 5", group=ruleGroup, tooltip="Strict optional qualifier from the current 9-13 parameter description: Buy low < count-5 close; Sell high > count-5 close. A failed candidate leaves the accepted count at 7.")
+string terminalPrice = input.string("Close", "Final Sequential Comparison", options=["Close", "Open or Close"], group=ruleGroup, tooltip="Close preserves the original comparison. Open or Close also accepts a qualifying open at candidate 13; the 13-vs-8 extreme qualifier still applies.")
+string riskTiePolicy = input.string("Latest", "Risk Extreme Tie Policy", options=["Latest", "First", "Widest true range"], group=ruleGroup, tooltip="Published material does not resolve tied extreme bars. This explicit choice determines which tied bar supplies the true range.")
+
+string comboGroup = "Combo Rules"
+bool comboReq1 = input.bool(true, "Close vs High/Low Two Bars Earlier", group=comboGroup)
+bool comboReq2 = input.bool(true, "Require Intraday Extreme vs Prior Bar", group=comboGroup)
+bool comboReq3 = input.bool(true, "Close vs Previous Bar Close", group=comboGroup)
+bool comboReq4 = input.bool(true, "Close vs Previous Counted Combo Close", group=comboGroup)
+bool comboExtremeAllowsEqual = input.bool(false, "Allow Equal Intraday Extremes", group=comboGroup, tooltip="OFF preserves the original strict high/low comparison, also described in DeMark's 2007 interview. ON selects the inclusive book convention. Ratcheting closes remain strict.")
+bool relaxBars11to13 = input.bool(true, "Final 11–13: Successive Counted Closes Only", group=comboGroup, tooltip="Descriptive legacy relaxed variant: after count 10, require only a new close beyond the previous counted Combo close. This is not Sequential counting. Disable to apply all selected conditions through 13.")
+
+string recycleGroup = "Recycling — Explicit Policy"
+bool enableRecycling = input.bool(true, "Enable Recycling", group=recycleGroup)
+string recycleMode = input.string("22 only", "Recycle Criteria", options=["22 only", "22 or size 100–200%"], group=recycleGroup, tooltip="A subsequent same-direction Setup reaching 22 clears the older unfinished countdown or marks its overlapping completed 13 as R. The originating Setup cannot recycle its own countdown merely by reaching 22. A later Setup 9 rearms a cleared series. Optional size rule replaces an active countdown at a later Setup 9 when its range is 1–2 times the originating extended range. One active countdown per direction; proprietary hidden parallel-count rules are not reproduced.")
+
+// ── TDST: validity and presentation are separate ──────────────────────────────
+string tdstGroup = "TDST — Multiple Live Levels"
+bool showTDST = input.bool(true, "Show TDST Lines", group=tdstGroup)
+string tdstDisplayMode = input.string("Visible candle range", "TDST Display", options=["Visible candle range", "All live levels", "Latest per side"], group=tdstGroup, tooltip="Visible candle range draws only levels inside the visible candles' high/low envelope. Hidden records are retained. All live levels works best with TradingView's 'Scale price chart only' chart setting.")
+float visiblePaddingPct = input.float(0.0, "Visible Range Padding (%)", minval=0, maxval=50, step=1, group=tdstGroup, tooltip="Zero keeps TDST drawings within the visible candles' price range. Positive padding permits a bounded amount of extra price-axis range.")
+int maxLinesPerSide = input.int(12, "Maximum Drawn TDST Lines per Side", minval=1, maxval=30, group=tdstGroup, tooltip="Newest eligible live levels are drawn first. This limits drawings, never the live-level registry; the table reports hidden levels.")
+bool showTDSTPriceLabels = input.bool(true, "Label TDST Prices", group=tdstGroup)
+bool startLinesAtSetup1 = input.bool(true, "Anchor Lines Back to Setup 1", group=tdstGroup, tooltip="ON aligns the line's left endpoint with the actual Setup 1 candle. The level still becomes known only at confirmed Setup 9. OFF starts the drawing at Setup 9.")
+bool enableBreakoutQualifiers = input.bool(true, "Use Published Three-Rule Breakout Filter", group=tdstGroup, tooltip="Uses three alternative qualifiers from DeMark's 2007 interview: prior opposite close, opening gap plus extension, or prior pressure projection. This is not a claim of exact modern Symbolik qualification parity.")
+string tdstBreakBasis = input.string("Close", "Qualified TDST Break Basis", options=["Close", "High / Low penetration"], group=tdstGroup, tooltip="Close requires a confirmed close beyond the level. Penetration permits the confirmed bar's high/low to cross it. With qualifiers OFF, a close beyond the level is always required.")
+
+string tdstLineGroup = "TDST — Line Appearance"
+string tdstUnconfirmedStyle = input.string("Dotted", "Unconfirmed Line Style", options=["Dotted", "Solid", "Dashed"], group=tdstLineGroup, tooltip="Appearance while no break has passed the selected confirmation rule. A failed/disqualified attempt keeps this style; it does not confirm the break.")
+int tdstUnconfirmedWidth = input.int(1, "Unconfirmed Line Width (px)", minval=1, maxval=4, group=tdstLineGroup)
+string tdstConfirmedStyle = input.string("Solid", "Confirmed Break Line Style", options=["Solid", "Dotted", "Dashed"], group=tdstLineGroup)
+int tdstConfirmedWidth = input.int(1, "Confirmed Break Line Width (px)", minval=1, maxval=4, group=tdstLineGroup)
+bool showConfirmedTDSTBreaks = input.bool(true, "Show Confirmed Break History", group=tdstLineGroup, tooltip="After confirmation, retain the line in its confirmed style, ending at the break candle. It is a historical segment, no longer a live support/resistance ray. The visible price filter still applies.")
+int maxConfirmedLinesPerSide = input.int(6, "Maximum Confirmed Break Lines per Side", minval=1, maxval=12, group=tdstLineGroup, tooltip="Most recent confirmed breaks intersecting the visible time range are shown first. Separate from the live-line budget; this never deletes level records.")
+
+// ── Data structures ───────────────────────────────────────────────────────────
+type CountMark
+    label id
+    int number
+
+type CountBar
+    int stamp
+    int number
+    float closeValue
+
+type PriceLevel
+    float price
+    bool resistance
+    int bornTime
+    int originTime
+    int bornBar
+    int kind = 0                 // 0 TDST; 1 Sequential risk reference
+    int brokenTime = na
+    int recycledTime = na        // Only risk references; known on the recycle bar
+    int firstDisqualifiedTime = na
+    line drawing = na
+    label priceLabel = na
+
+type CompletedCount
+    int barNumber
+    int stamp
+    int ownerStart
+    label mark
+    PriceLevel riskLevel
+    int recycledTime = na
+
+type Countdown
+    bool buy
+    bool combo
+    bool active = false
+    int count = 0
+    int ownerStart = na
+    int ownerTime = na
+    float ownTDST = na
+    float referenceHigh = na
+    float referenceLow = na
+    float previousCountClose = na
+    float bar5Close = na
+    float bar8Close = na
+    float riskExtreme = na
+    float riskExtremeRange = na
+    int firstCountTime = na
+    int evaluatedBar = na
+    array<CountMark> marks
+    array<CountBar> records
+    array<CompletedCount> completions
+    label deferralLabel = na
+    int deferredCandidate = 0
+    bool countEvent = false
+    bool completionEvent = false
+    bool deferralEvent = false
+    bool cancelEvent = false
+    bool recycleEvent = false
+    int last13Bar = na
+    int last13Time = na
+    bool last13Recycled = false
+    label last13Label = na
+    float lastRisk = na
+
+type Setup
+    bool buy
+    int count = 0
+    int startBar = na
+    int startTime = na
+    float runHigh = na
+    float runLow = na
+    float nineHigh = na
+    float nineLow = na
+    float extreme6 = na
+    float extreme7 = na
+    float extreme8 = na
+    bool nineEvent = false
+    bool extended22Event = false
+    array<CountMark> marks
+    Countdown candidate
+
+type PendingPerfection
+    bool buy
+    float threshold
+    int setupTime
+
+var array<label> historicalLabels = array.new<label>()
+var array<PriceLevel> levelHistory = array.new<PriceLevel>()
+var array<PriceLevel> liveTDST = array.new<PriceLevel>()
+var array<PendingPerfection> pendingPerfections = array.new<PendingPerfection>()
+
+f_size(string s) =>
+    switch s
+        "tiny" => size.tiny
+        "small" => size.small
+        "normal" => size.normal
+        "large" => size.large
+        "huge" => size.huge
+        => size.auto
+
+f_trueHigh() => math.max(high, nz(close[1], high))
+f_trueLow() => math.min(low, nz(close[1], low))
+
+f_keepLabel(label id) =>
+    if not na(id)
+        array.push(historicalLabels, id)
+        while array.size(historicalLabels) > historyLabelBudget
+            label.delete(array.shift(historicalLabels))
+    true
+
+f_finishMarks(array<CountMark> marks, bool success) =>
+    for m in marks
+        if success and (not showOnlyCompletion or (showNewCountStarts and m.number == 1))
+            f_keepLabel(m.id)
+        else
+            label.delete(m.id)
+    array.clear(marks)
+    true
+
+f_newCountdown(bool buy, bool combo) =>
+    Countdown c = Countdown.new(buy=buy, combo=combo)
+    c.marks := array.new<CountMark>()
+    c.records := array.new<CountBar>()
+    c.completions := array.new<CompletedCount>()
+    c
+
+f_newSetup(bool buy) =>
+    Setup s = Setup.new(buy=buy)
+    s.marks := array.new<CountMark>()
+    s.candidate := f_newCountdown(buy, true)
+    s
+
+f_countColour(Countdown c) =>
+    c.combo ? (c.buy ? comboBuyColor : comboSellColor) : (c.buy ? buyCountdownColor : sellCountdownColor)
+
+f_countText(Countdown c, string value) =>
+    string textValue = (c.combo ? "C" : "S") + value
+    c.buy ? ((c.combo ? "\n\n" : "\n") + textValue) : (textValue + (c.combo ? "\n\n" : "\n"))
+
+f_countVisible(Countdown c, int n) =>
+    bool progress = c.combo ? showCurrentComboProgress : showCurrentSeqProgress
+    showCountdown and (c.combo ? showCombo : showSequential) and (n == 13 or not showOnlyCompletion or progress or (n == 1 and showNewCountStarts))
+
+f_drawCount(Countdown c, CountBar b) =>
+    label id = na
+    if f_countVisible(c, b.number)
+        id := label.new(b.stamp, na, f_countText(c, str.tostring(b.number)), xloc=xloc.bar_time, yloc=c.buy ? yloc.belowbar : yloc.abovebar, style=label.style_none, textcolor=f_countColour(c), size=f_size(b.number == 13 ? completionSize : countdownSize), tooltip=(c.combo ? "Validated Combo" : "Sequential") + " count " + str.tostring(b.number) + ". Committed on a closed bar.")
+        if b.number == 13
+            f_keepLabel(id)
+        else
+            array.push(c.marks, CountMark.new(id, b.number))
+    id
+
+method clearEvents(Countdown c) =>
+    c.countEvent := false
+    c.completionEvent := false
+    c.deferralEvent := false
+    c.cancelEvent := false
+    c.recycleEvent := false
+    true
+
+method discard(Countdown c) =>
+    f_finishMarks(c.marks, false)
+    label.delete(c.deferralLabel)
+    c.deferralLabel := na
+    c.deferredCandidate := 0
+    array.clear(c.records)
+    c.active := false
+    c.count := 0
+    c.previousCountClose := na
+    c.bar5Close := na
+    c.bar8Close := na
+    c.riskExtreme := na
+    c.riskExtremeRange := na
+    c.firstCountTime := na
+    c.evaluatedBar := na
+    true
+
+method initialise(Countdown c, Setup s) =>
+    c.discard()
+    c.active := true
+    c.ownerStart := s.startBar
+    c.ownerTime := s.startTime
+    c.ownTDST := s.buy ? s.nineHigh : s.nineLow
+    c.referenceHigh := s.runHigh
+    c.referenceLow := s.runLow
+    true
+
+method updateRisk(Countdown c) =>
+    float th = f_trueHigh()
+    float tl = f_trueLow()
+    float extreme = c.buy ? tl : th
+    float trueRange = th - tl
+    bool beyond = na(c.riskExtreme) or (c.buy ? extreme < c.riskExtreme : extreme > c.riskExtreme)
+    bool tied = not na(c.riskExtreme) and extreme == c.riskExtreme
+    bool replaceTie = tied and (riskTiePolicy == "Latest" or (riskTiePolicy == "Widest true range" and trueRange > c.riskExtremeRange))
+    if beyond or replaceTie
+        c.riskExtreme := extreme
+        c.riskExtremeRange := trueRange
+    true
+
+method tick(Countdown c, bool drawMarks) =>
+    if c.active and (na(c.evaluatedBar) or c.evaluatedBar != bar_index)
+        c.evaluatedBar := bar_index
+        // Risk scan includes unnumbered and deferred bars after actual count 1.
+        if c.count > 0
+            c.updateRisk()
+        bool eligible = c.buy ? close <= low[2] : close >= high[2]
+        if c.combo
+            if relaxBars11to13 and c.count >= 10
+                eligible := c.buy ? close < c.previousCountClose : close > c.previousCountClose
+            else
+                bool extremeOK = c.buy ? (comboExtremeAllowsEqual ? low <= low[1] : low < low[1]) : (comboExtremeAllowsEqual ? high >= high[1] : high > high[1])
+                bool previousOK = c.buy ? close < close[1] : close > close[1]
+                bool ratchetOK = na(c.previousCountClose) or (c.buy ? close < c.previousCountClose : close > c.previousCountClose)
+                eligible := (not comboReq1 or eligible) and (not comboReq2 or extremeOK) and (not comboReq3 or previousOK) and (not comboReq4 or ratchetOK)
+        else if c.count == 12 and terminalPrice == "Open or Close"
+            eligible := eligible or (c.buy ? open <= low[2] : open >= high[2])
+        if eligible
+            int nextCount = c.count + 1
+            bool qualifierOK = true
+            if not c.combo and nextCount == 8 and require8vs5
+                qualifierOK := not na(c.bar5Close) and (c.buy ? low < c.bar5Close : high > c.bar5Close)
+            if not c.combo and nextCount == 13 and require13vs8
+                qualifierOK := not na(c.bar8Close) and (c.buy ? low <= c.bar8Close : high >= c.bar8Close)
+            if not qualifierOK
+                // Keep the accepted count at 7 or 12. Cancellation remains possible.
+                c.deferralEvent := true
+                c.deferredCandidate := nextCount
+                if drawMarks and showDeferred and f_countVisible(c, 13)
+                    label.delete(c.deferralLabel)
+                    c.deferralLabel := label.new(time, na, f_countText(c, "+"), xloc=xloc.bar_time, yloc=c.buy ? yloc.belowbar : yloc.abovebar, style=label.style_none, textcolor=f_countColour(c), size=f_size(countdownSize), tooltip="Candidate " + str.tostring(nextCount) + " deferred. Accepted count remains " + str.tostring(c.count) + ". Only the latest deferral marker is retained.")
+            else
+                if c.count == 0
+                    c.firstCountTime := time
+                    c.updateRisk()
+                c.count := nextCount
+                c.countEvent := true
+                c.previousCountClose := close
+                if nextCount == 5
+                    c.bar5Close := close
+                if nextCount == 8
+                    c.bar8Close := close
+                label.delete(c.deferralLabel)
+                c.deferralLabel := na
+                c.deferredCandidate := 0
+                CountBar record = CountBar.new(time, nextCount, close)
+                array.push(c.records, record)
+                if nextCount == 13
+                    c.active := false
+                    c.completionEvent := true
+                    c.last13Bar := bar_index
+                    c.last13Time := time
+                    c.last13Recycled := false
+                    c.lastRisk := c.buy ? c.riskExtreme - c.riskExtremeRange : c.riskExtreme + c.riskExtremeRange
+                    f_finishMarks(c.marks, true)
+                    c.last13Label := drawMarks ? f_drawCount(c, record) : na
+                    array.push(c.completions, CompletedCount.new(barNumber=bar_index, stamp=time, ownerStart=c.ownerStart, mark=c.last13Label))
+                else if drawMarks
+                    f_drawCount(c, record)
+    true
+
+method promote(Countdown c, Setup s) =>
+    c.initialise(s)
+    Countdown candidate = s.candidate
+    c.count := candidate.count
+    c.previousCountClose := candidate.previousCountClose
+    c.bar5Close := candidate.bar5Close
+    c.bar8Close := candidate.bar8Close
+    c.riskExtreme := candidate.riskExtreme
+    c.riskExtremeRange := candidate.riskExtremeRange
+    c.firstCountTime := candidate.firstCountTime
+    c.evaluatedBar := candidate.evaluatedBar
+    c.records := array.copy(candidate.records)
+    for record in c.records
+        f_drawCount(c, record)
+    // Past Combo marks become visible only now, after their Setup is valid.
+    c.countEvent := c.count > 0
+    true
+
+f_addLevel(float price, bool resistance, int originTime, int kind) =>
+    if array.size(levelHistory) >= 95000
+        runtime.error("Level record capacity reached. Reduce loaded history; no live levels have been silently expired.")
+    PriceLevel level = PriceLevel.new(price=price, resistance=resistance, bornTime=time, originTime=originTime, bornBar=bar_index, kind=kind)
+    array.push(levelHistory, level)
+    if kind == 0
+        array.push(liveTDST, level)
+    level
+
+f_perfectionMet(bool buy, float extreme, float threshold) =>
+    buy ? (perfectionAllowsEqual ? extreme <= threshold : extreme < threshold) : (perfectionAllowsEqual ? extreme >= threshold : extreme > threshold)
+
+f_perfectionMark(bool buy, int setupTime) =>
+    if showPerfection
+        label id = label.new(time, na, buy ? "\n\n\n▲" : "▼\n\n\n", xloc=xloc.bar_time, yloc=buy ? yloc.belowbar : yloc.abovebar, style=label.style_none, textcolor=perfectionColor, size=f_size(completionSize), tooltip="Setup perfection confirmed now. Setup 9 date: " + str.format_time(setupTime, "yyyy-MM-dd HH:mm", syminfo.timezone))
+        f_keepLabel(id)
+    true
+
+method advance(Setup s) =>
+    bool comparison = s.buy ? close < close[4] : close > close[4]
+    bool priorOpposite = s.buy ? (strictPriceFlip ? close[1] > close[5] : close[1] >= close[5]) : (strictPriceFlip ? close[1] < close[5] : close[1] <= close[5])
+    bool start = s.count == 0 and comparison and priorOpposite
+    if s.count > 0 and not comparison
+        if s.count < 9
+            f_finishMarks(s.marks, false)
+        s.count := 0
+        s.candidate.discard()
+    if start
+        s.count := 1
+        s.startBar := bar_index
+        s.startTime := time
+        s.runHigh := f_trueHigh()
+        s.runLow := f_trueLow()
+        s.nineHigh := na
+        s.nineLow := na
+        s.extreme6 := na
+        s.extreme7 := na
+        s.extreme8 := na
+        s.candidate.discard()
+        s.candidate.active := true
+    else if s.count > 0 and comparison
+        s.count += 1
+        s.runHigh := math.max(s.runHigh, f_trueHigh())
+        s.runLow := math.min(s.runLow, f_trueLow())
+    if s.count > 0 and s.count <= 9
+        float extreme = s.buy ? low : high
+        if s.count == 6
+            s.extreme6 := extreme
+        if s.count == 7
+            s.extreme7 := extreme
+        if s.count == 8
+            s.extreme8 := extreme
+        // Provisional counting is never a valid Combo before Setup 9.
+        s.candidate.tick(false)
+        if s.count == 9
+            s.nineEvent := true
+            s.nineHigh := s.runHigh
+            s.nineLow := s.runLow
+            f_finishMarks(s.marks, true)
+        if showSetup and (s.count == 9 or not showOnlyCompletion or showCurrentSetupProgress or (s.count == 1 and showNewCountStarts))
+            label id = label.new(time, na, str.tostring(s.count), xloc=xloc.bar_time, yloc=s.buy ? yloc.belowbar : yloc.abovebar, style=label.style_none, textcolor=s.buy ? buySetupColor : sellSetupColor, size=f_size(s.count == 9 ? completionSize : setupSize))
+            if s.count == 9
+                f_keepLabel(id)
+            else
+                array.push(s.marks, CountMark.new(id, s.count))
+    s.extended22Event := s.count == 22
+    true
+
+f_sizeReplaces(Countdown c, Setup s) =>
+    float previousRange = c.referenceHigh - c.referenceLow
+    float newRange = s.runHigh - s.runLow
+    enableRecycling and recycleMode == "22 or size 100–200%" and c.active and c.ownerStart != s.startBar and previousRange > 0 and newRange >= previousRange and newRange <= 2.0 * previousRange
+
+method govern(Countdown c, Setup ownSetup, bool oppositeNine) =>
+    if c.active
+        bool tdstViolated = enableTDSTCancellation and not na(c.ownTDST) and (c.buy ? f_trueLow() > c.ownTDST : f_trueHigh() < c.ownTDST)
+        if oppositeNine or tdstViolated
+            c.discard()
+            c.cancelEvent := true
+    if ownSetup.nineEvent
+        bool replace = f_sizeReplaces(c, ownSetup)
+        if not c.active or replace
+            if replace
+                c.recycleEvent := true
+            if c.combo
+                c.promote(ownSetup)
+            else
+                c.initialise(ownSetup)
+    // The recycle envelope may extend beyond 9; TDST itself stays fixed at 9.
+    if c.active and ownSetup.count >= 9 and c.ownerStart == ownSetup.startBar
+        c.referenceHigh := ownSetup.runHigh
+        c.referenceLow := ownSetup.runLow
+    if enableRecycling and ownSetup.extended22Event
+        // A genuinely subsequent Setup must overlap the older series. Extending
+        // the originating Setup to 22 cannot recycle its own countdown.
+        for completed in c.completions
+            bool overlaps13 = ownSetup.startBar > completed.ownerStart and ownSetup.startBar <= completed.barNumber and na(completed.recycledTime)
+            if overlaps13
+                completed.recycledTime := time
+                c.recycleEvent := true
+                if completed.barNumber == c.last13Bar
+                    c.last13Recycled := true
+                if not na(completed.mark)
+                    label.set_text(completed.mark, f_countText(c, "R"))
+                    label.set_tooltip(completed.mark, "Completed 13 subsequently recycled by a later overlapping Setup reaching 22. Recycling became known on " + str.format_time(time, "yyyy-MM-dd HH:mm", syminfo.timezone) + ".")
+                if not na(completed.riskLevel)
+                    completed.riskLevel.recycledTime := time
+        if c.active and ownSetup.startBar > c.ownerStart
+            c.discard()
+            c.recycleEvent := true
+            // Explicit single-series policy: a subsequent Setup 9 rearms it.
+    true
+
+f_breakoutQualified(bool resistance, float price) =>
+    float priorTrueLow = math.min(low[1], close[2])
+    float priorTrueHigh = math.max(high[1], close[2])
+    bool q1 = resistance ? close[1] < close[2] : close[1] > close[2]
+    bool q2 = resistance ? (open > price and high > open) : (open < price and low < open)
+    bool q3 = resistance ? 2.0 * close[1] - priorTrueLow < price : 2.0 * close[1] - priorTrueHigh > price
+    q1 or q2 or q3
+
+// ── Persistent engine instances ───────────────────────────────────────────────
+var Setup buySetup = f_newSetup(true)
+var Setup sellSetup = f_newSetup(false)
+var Countdown buySeq = f_newCountdown(true, false)
+var Countdown sellSeq = f_newCountdown(false, false)
+var Countdown buyCombo = f_newCountdown(true, true)
+var Countdown sellCombo = f_newCountdown(false, true)
+
+// Events are reset on EVERY execution; lasting state never drives alert pulses.
+buySetup.nineEvent := false
+sellSetup.nineEvent := false
+buySetup.extended22Event := false
+sellSetup.extended22Event := false
+buySeq.clearEvents()
+sellSeq.clearEvents()
+buyCombo.clearEvents()
+sellCombo.clearEvents()
+buySetup.candidate.clearEvents()
+sellSetup.candidate.clearEvents()
+bool buyPerfectEvent = false
+bool sellPerfectEvent = false
+bool resistanceQualifiedEvent = false
+bool supportQualifiedEvent = false
+bool resistanceDisqualifiedEvent = false
+bool supportDisqualifiedEvent = false
+
+if barstate.isconfirmed and bar_index >= 5
+    // Later perfection is independent of an unfinished new Setup.
+    int p = array.size(pendingPerfections) - 1
+    while p >= 0
+        PendingPerfection pending = array.get(pendingPerfections, p)
+        if f_perfectionMet(pending.buy, pending.buy ? low : high, pending.threshold)
+            f_perfectionMark(pending.buy, pending.setupTime)
+            buyPerfectEvent := buyPerfectEvent or pending.buy
+            sellPerfectEvent := sellPerfectEvent or not pending.buy
+            array.remove(pendingPerfections, p)
+        p -= 1
+
+    buySetup.advance()
+    sellSetup.advance()
+    for s in array.from(buySetup, sellSetup)
+        if s.nineEvent
+            f_addLevel(s.buy ? s.nineHigh : s.nineLow, s.buy, s.startTime, 0)
+            float threshold = s.buy ? math.min(s.extreme6, s.extreme7) : math.max(s.extreme6, s.extreme7)
+            bool perfect = f_perfectionMet(s.buy, s.extreme8, threshold) or f_perfectionMet(s.buy, s.buy ? low : high, threshold)
+            if perfect
+                f_perfectionMark(s.buy, time)
+                buyPerfectEvent := buyPerfectEvent or s.buy
+                sellPerfectEvent := sellPerfectEvent or not s.buy
+            else
+                array.push(pendingPerfections, PendingPerfection.new(s.buy, threshold, time))
+
+    // Cancellation / replacement precedes accepting another count on this bar.
+    buySeq.govern(buySetup, sellSetup.nineEvent)
+    sellSeq.govern(sellSetup, buySetup.nineEvent)
+    buyCombo.govern(buySetup, sellSetup.nineEvent)
+    sellCombo.govern(sellSetup, buySetup.nineEvent)
+    buySeq.tick(true)
+    sellSeq.tick(true)
+    buyCombo.tick(true)
+    sellCombo.tick(true)
+    if buySetup.nineEvent
+        buySetup.candidate.active := false
+    if sellSetup.nineEvent
+        sellSetup.candidate.active := false
+
+    if buySeq.completionEvent
+        PriceLevel risk = f_addLevel(buySeq.lastRisk, false, buySeq.firstCountTime, 1)
+        CompletedCount completed = array.get(buySeq.completions, array.size(buySeq.completions) - 1)
+        completed.riskLevel := risk
+    if sellSeq.completionEvent
+        PriceLevel risk = f_addLevel(sellSeq.lastRisk, true, sellSeq.firstCountTime, 1)
+        CompletedCount completed = array.get(sellSeq.completions, array.size(sellSeq.completions) - 1)
+        completed.riskLevel := risk
+
+    // Logical TDST survival is never inside a show/hide or viewport condition.
+    int i = array.size(liveTDST) - 1
+    while i >= 0
+        PriceLevel level = array.get(liveTDST, i)
+        if bar_index > level.bornBar
+            bool closeBeyond = level.resistance ? close > level.price : close < level.price
+            bool penetration = level.resistance ? high > level.price : low < level.price
+            bool attempt = not enableBreakoutQualifiers or tdstBreakBasis == "Close" ? closeBeyond : penetration
+            if attempt
+                bool qualified = not enableBreakoutQualifiers or f_breakoutQualified(level.resistance, level.price)
+                if qualified
+                    level.brokenTime := time
+                    resistanceQualifiedEvent := resistanceQualifiedEvent or level.resistance
+                    supportQualifiedEvent := supportQualifiedEvent or not level.resistance
+                    array.remove(liveTDST, i)
+                else
+                    bool newEpisode = na(level.firstDisqualifiedTime) or (level.resistance ? close[1] <= level.price : close[1] >= level.price)
+                    if na(level.firstDisqualifiedTime)
+                        level.firstDisqualifiedTime := time
+                    if newEpisode
+                        resistanceDisqualifiedEvent := resistanceDisqualifiedEvent or level.resistance
+                        supportDisqualifiedEvent := supportDisqualifiedEvent or not level.resistance
+                    // A return through the level does not retire it. Later
+                    // qualifying attempts remain eligible to retire the level.
+        i -= 1
+
+// ── Visible-window presentation; no signal calculations below depend on it ────
+var float visibleHigh = na
+var float visibleLow = na
+var float visibleClose = na
+var int lastConfirmedTime = na
+var int lastConfirmedBar = na
+if barstate.isconfirmed
+    lastConfirmedTime := time
+    lastConfirmedBar := bar_index
+if time >= chart.left_visible_bar_time and time <= chart.right_visible_bar_time
+    visibleHigh := na(visibleHigh) ? high : math.max(visibleHigh, high)
+    visibleLow := na(visibleLow) ? low : math.min(visibleLow, low)
+    visibleClose := close
+
+f_deleteDrawing(PriceLevel level) =>
+    line.delete(level.drawing)
+    label.delete(level.priceLabel)
+    level.drawing := na
+    level.priceLabel := na
+    true
+
+f_tdstLineStyle(string choice) =>
+    switch choice
+        "Dotted" => line.style_dotted
+        "Dashed" => line.style_dashed
+        => line.style_solid
+
+f_pickConfirmedLevel(array<PriceLevel> selected, PriceLevel candidate) =>
+    // Rank history by confirmation time, so a newly confirmed older Setup is
+    // not hidden behind more recently created levels that broke earlier.
+    int position = 0
+    while position < array.size(selected)
+        PriceLevel existing = array.get(selected, position)
+        if candidate.brokenTime > existing.brokenTime or (candidate.brokenTime == existing.brokenTime and candidate.bornTime > existing.bornTime)
+            break
+        position += 1
+    if position < maxConfirmedLinesPerSide
+        array.insert(selected, position, candidate)
+        if array.size(selected) > maxConfirmedLinesPerSide
+            array.pop(selected)
+    true
+
+f_paintLevel(PriceLevel level, int viewEnd, bool isRisk) =>
+    bool confirmedBreak = not isRisk and not na(level.brokenTime) and level.brokenTime <= viewEnd
+    int startTime = startLinesAtSetup1 and not isRisk ? level.originTime : level.bornTime
+    // Preserve the TDST's actual Setup candle timestamp, including off-screen
+    // origins. Timestamp coordinates do not need a bar-index-distance clamp.
+    if isRisk
+        startTime := math.max(startTime, chart.left_visible_bar_time)
+    int endTime = confirmedBreak ? level.brokenTime : math.max(viewEnd, startTime + 1)
+    int labelTime = confirmedBreak ? level.brokenTime : viewEnd
+    color levelColour = isRisk ? (level.resistance ? sellCountdownColor : buyCountdownColor) : (level.resistance ? tdstResistanceColor : tdstSupportColor)
+    string lineStyle = isRisk ? line.style_dotted : f_tdstLineStyle(confirmedBreak ? tdstConfirmedStyle : tdstUnconfirmedStyle)
+    int lineWidth = isRisk ? 1 : (confirmedBreak ? tdstConfirmedWidth : tdstUnconfirmedWidth)
+    string lineExtension = confirmedBreak ? extend.none : extend.right
+    if na(level.drawing)
+        level.drawing := line.new(startTime, level.price, endTime, level.price, xloc=xloc.bar_time, extend=lineExtension, color=levelColour, style=lineStyle, width=lineWidth)
+    else
+        line.set_xy1(level.drawing, startTime, level.price)
+        line.set_xy2(level.drawing, endTime, level.price)
+        line.set_color(level.drawing, levelColour)
+        line.set_style(level.drawing, lineStyle)
+        line.set_width(level.drawing, lineWidth)
+        line.set_extend(level.drawing, lineExtension)
+    if showTDSTPriceLabels
+        string title = isRisk ? "S risk ref" : (level.resistance ? "TDST R" : "TDST S") + (confirmedBreak ? " broken" : "")
+        string tooltip = title + ": " + str.tostring(level.price, format.mintick) + "\nKnown from: " + str.format_time(level.bornTime, "yyyy-MM-dd HH:mm", syminfo.timezone)
+        if not isRisk
+            tooltip += "\nSetup 1: " + str.format_time(level.originTime, "yyyy-MM-dd HH:mm", syminfo.timezone)
+            if confirmedBreak
+                tooltip += "\nBreak confirmed under selected rule: " + str.format_time(level.brokenTime, "yyyy-MM-dd HH:mm", syminfo.timezone) + "\nHistorical segment; no longer a live TDST level."
+            else
+                bool alreadyDisqualified = not na(level.firstDisqualifiedTime) and level.firstDisqualifiedTime <= viewEnd
+                tooltip += alreadyDisqualified ? "\nDisqualified attempt retained; still live under selected rule." : "\nNo qualified break as of the viewed date."
+        if na(level.priceLabel)
+            level.priceLabel := label.new(labelTime, level.price, title + " " + str.tostring(level.price, format.mintick), xloc=xloc.bar_time, yloc=yloc.price, style=label.style_label_left, color=color.new(color.black, 100), textcolor=levelColour, size=size.tiny, tooltip=tooltip)
+        else
+            label.set_xy(level.priceLabel, labelTime, level.price)
+            label.set_text(level.priceLabel, title + " " + str.tostring(level.price, format.mintick))
+            label.set_tooltip(level.priceLabel, tooltip)
+    else
+        label.delete(level.priceLabel)
+        level.priceLabel := na
+    true
+
+f_status(Countdown c) =>
+    c.active ? str.tostring(c.count) + (c.deferredCandidate > 0 ? " +" : "") : "–"
+
+f_price(float value) => na(value) ? "–" : str.tostring(value, format.mintick)
+
+var table statusTable = table.new(position.top_right, 4, 12, bgcolor=color.new(color.black, 18), border_width=1)
+if barstate.islast
+    int viewEnd = math.min(chart.right_visible_bar_time, nz(lastConfirmedTime, time))
+    float padding = na(visibleHigh) or na(visibleLow) ? 0.0 : (visibleHigh - visibleLow) * visiblePaddingPct / 100.0
+    float viewBottom = visibleLow - padding
+    float viewTop = visibleHigh + padding
+    int liveSupportCount = 0
+    int liveResistanceCount = 0
+    int drawnSupportCount = 0
+    int drawnResistanceCount = 0
+    float hiddenSupport = na
+    float hiddenResistance = na
+    bool buyRiskSelected = false
+    bool sellRiskSelected = false
+    int limitPerSide = tdstDisplayMode == "Latest per side" ? 1 : maxLinesPerSide
+    array<PriceLevel> levelsToDraw = array.new<PriceLevel>()
+    array<PriceLevel> confirmedSupport = array.new<PriceLevel>()
+    array<PriceLevel> confirmedResistance = array.new<PriceLevel>()
+    // Creation and break times reconstruct live levels AS OF the viewed date,
+    // including levels that have since broken. No hindsight-only survivor list.
+    int j = array.size(levelHistory) - 1
+    while j >= 0
+        PriceLevel level = array.get(levelHistory, j)
+        bool existed = level.bornTime <= viewEnd
+        bool liveAtView = existed and (na(level.brokenTime) or level.brokenTime > viewEnd)
+        bool confirmedAtView = existed and not na(level.brokenTime) and level.brokenTime <= viewEnd
+        bool insidePrices = not na(viewBottom) and not na(viewTop) and level.price >= viewBottom and level.price <= viewTop
+        bool priceEligible = tdstDisplayMode != "Visible candle range" or insidePrices
+        bool draw = false
+        if level.kind == 0 and liveAtView
+            if level.resistance
+                liveResistanceCount += 1
+                draw := showTDST and priceEligible and drawnResistanceCount < limitPerSide
+                if draw
+                    drawnResistanceCount += 1
+                else if na(hiddenResistance) or math.abs(level.price - visibleClose) < math.abs(hiddenResistance - visibleClose)
+                    hiddenResistance := level.price
+            else
+                liveSupportCount += 1
+                draw := showTDST and priceEligible and drawnSupportCount < limitPerSide
+                if draw
+                    drawnSupportCount += 1
+                else if na(hiddenSupport) or math.abs(level.price - visibleClose) < math.abs(hiddenSupport - visibleClose)
+                    hiddenSupport := level.price
+        else if level.kind == 0 and confirmedAtView
+            if showTDST and showConfirmedTDSTBreaks and priceEligible and level.brokenTime >= chart.left_visible_bar_time
+                if level.resistance
+                    f_pickConfirmedLevel(confirmedResistance, level)
+                else
+                    f_pickConfirmedLevel(confirmedSupport, level)
+        else if level.kind == 1 and existed
+            bool alreadySelected = level.resistance ? sellRiskSelected : buyRiskSelected
+            if not alreadySelected
+                if level.resistance
+                    sellRiskSelected := true
+                else
+                    buyRiskSelected := true
+                bool recycledAtView = not na(level.recycledTime) and level.recycledTime <= viewEnd
+                draw := showRiskLevel and priceEligible and not recycledAtView
+        if draw
+            array.push(levelsToDraw, level)
+        else
+            f_deleteDrawing(level)
+        j -= 1
+
+    // Delete obsolete drawings before painting the new selection, so panning
+    // cannot temporarily double the drawing count and evict count labels.
+    for level in confirmedSupport
+        array.push(levelsToDraw, level)
+    for level in confirmedResistance
+        array.push(levelsToDraw, level)
+    for level in levelsToDraw
+        f_paintLevel(level, viewEnd, level.kind == 1)
+
+    table.clear(statusTable, 0, 0, 3, 11)
+    if showInfoTable
+        table.cell(statusTable, 0, 0, "TDST as of", text_color=color.white, text_size=size.small)
+        table.cell(statusTable, 1, 0, str.format_time(viewEnd, "yyyy-MM-dd", syminfo.timezone), text_color=color.white, text_size=size.small)
+        table.cell(statusTable, 2, 0, "Live / drawn", text_color=color.white, text_size=size.small)
+        table.cell(statusTable, 3, 0, "Nearest hidden", text_color=color.white, text_size=size.small)
+        table.cell(statusTable, 0, 1, "Support", text_color=tdstSupportColor, text_size=size.small)
+        table.cell(statusTable, 2, 1, str.tostring(liveSupportCount) + " / " + str.tostring(drawnSupportCount), text_color=color.white, text_size=size.small)
+        table.cell(statusTable, 3, 1, f_price(hiddenSupport), text_color=tdstSupportColor, text_size=size.small)
+        table.cell(statusTable, 0, 2, "Resistance", text_color=tdstResistanceColor, text_size=size.small)
+        table.cell(statusTable, 2, 2, str.tostring(liveResistanceCount) + " / " + str.tostring(drawnResistanceCount), text_color=color.white, text_size=size.small)
+        table.cell(statusTable, 3, 2, f_price(hiddenResistance), text_color=tdstResistanceColor, text_size=size.small)
+        table.cell(statusTable, 0, 3, "Filter / basis", text_color=color.silver, text_size=size.tiny)
+        table.cell(statusTable, 1, 3, enableBreakoutQualifiers ? "3-rule filter" : "No qualifiers", text_color=color.silver, text_size=size.tiny)
+        table.cell(statusTable, 2, 3, enableBreakoutQualifiers ? tdstBreakBasis : "Close", text_color=color.silver, text_size=size.tiny)
+        table.cell(statusTable, 3, 3, "Loaded history", text_color=color.silver, text_size=size.tiny)
+        table.cell(statusTable, 0, 4, "Latest confirmed", text_color=color.white, text_size=size.small)
+        table.cell(statusTable, 1, 4, "Buy", text_color=buySetupColor, text_size=size.small)
+        table.cell(statusTable, 2, 4, "Sell", text_color=sellSetupColor, text_size=size.small)
+        table.cell(statusTable, 0, 5, "Setup run", text_color=color.white, text_size=size.small)
+        table.cell(statusTable, 1, 5, str.tostring(buySetup.count), text_color=buySetupColor, text_size=size.small)
+        table.cell(statusTable, 2, 5, str.tostring(sellSetup.count), text_color=sellSetupColor, text_size=size.small)
+        table.cell(statusTable, 0, 6, "Sequential", text_color=color.white, text_size=size.small)
+        table.cell(statusTable, 1, 6, f_status(buySeq), text_color=buyCountdownColor, text_size=size.small)
+        table.cell(statusTable, 2, 6, f_status(sellSeq), text_color=sellCountdownColor, text_size=size.small)
+        table.cell(statusTable, 0, 7, "Combo", text_color=color.white, text_size=size.small)
+        table.cell(statusTable, 1, 7, f_status(buyCombo), text_color=comboBuyColor, text_size=size.small)
+        table.cell(statusTable, 2, 7, f_status(sellCombo), text_color=comboSellColor, text_size=size.small)
+        table.cell(statusTable, 0, 8, "Bars since S13", text_color=color.white, text_size=size.tiny)
+        table.cell(statusTable, 1, 8, na(buySeq.last13Bar) ? "–" : str.tostring(lastConfirmedBar - buySeq.last13Bar) + (buySeq.last13Recycled ? " R" : ""), text_color=color.silver, text_size=size.tiny)
+        table.cell(statusTable, 2, 8, na(sellSeq.last13Bar) ? "–" : str.tostring(lastConfirmedBar - sellSeq.last13Bar) + (sellSeq.last13Recycled ? " R" : ""), text_color=color.silver, text_size=size.tiny)
+        table.cell(statusTable, 0, 9, "S risk reference", text_color=color.white, text_size=size.tiny)
+        table.cell(statusTable, 1, 9, (buySeq.last13Recycled ? "R: " : "") + f_price(buySeq.lastRisk), text_color=color.silver, text_size=size.tiny)
+        table.cell(statusTable, 2, 9, (sellSeq.last13Recycled ? "R: " : "") + f_price(sellSeq.lastRisk), text_color=color.silver, text_size=size.tiny)
+        table.cell(statusTable, 0, 10, "Series policy", text_color=color.silver, text_size=size.tiny)
+        table.cell(statusTable, 1, 10, "1 active / side", text_color=color.silver, text_size=size.tiny)
+        table.cell(statusTable, 2, 10, enableRecycling ? recycleMode : "Recycle off", text_color=color.silver, text_size=size.tiny)
+        table.cell(statusTable, 0, 11, "Closed bars", text_color=color.silver, text_size=size.tiny)
+        table.cell(statusTable, 1, 11, not comboReq1 or not comboReq2 or not comboReq3 or not comboReq4 ? "Custom Combo" : "Published-rule variant", text_color=color.silver, text_size=size.tiny)
+        table.cell(statusTable, 2, 11, "Broken S / R", text_color=color.silver, text_size=size.tiny)
+        table.cell(statusTable, 3, 11, str.tostring(array.size(confirmedSupport)) + " / " + str.tostring(array.size(confirmedResistance)), text_color=color.silver, text_size=size.tiny)
+
+// ── Alerts: confirmed, one-bar events; enable display independently ────────────
+alertcondition(buySetup.nineEvent, "Buy Setup 9 Complete", "Buy Setup 9 completed on a confirmed bar; assess potential downside exhaustion.")
+alertcondition(sellSetup.nineEvent, "Sell Setup 9 Complete", "Sell Setup 9 completed on a confirmed bar; assess potential upside exhaustion.")
+alertcondition(buySeq.completionEvent, "Buy Sequential 13 Complete", "Buy Sequential 13 accepted on a confirmed bar.")
+alertcondition(sellSeq.completionEvent, "Sell Sequential 13 Complete", "Sell Sequential 13 accepted on a confirmed bar.")
+alertcondition(buyCombo.completionEvent, "Buy Combo 13 Complete", "Buy Combo 13 accepted after a validated Buy Setup.")
+alertcondition(sellCombo.completionEvent, "Sell Combo 13 Complete", "Sell Combo 13 accepted after a validated Sell Setup.")
+alertcondition(buySeq.deferralEvent, "Buy Sequential Deferred", "Buy Sequential candidate deferred; its accepted count remains active.")
+alertcondition(sellSeq.deferralEvent, "Sell Sequential Deferred", "Sell Sequential candidate deferred; its accepted count remains active.")
+alertcondition(buyPerfectEvent, "Perfected Buy Setup", "Buy Setup perfection confirmed on this bar; it may be later than Setup 9.")
+alertcondition(sellPerfectEvent, "Perfected Sell Setup", "Sell Setup perfection confirmed on this bar; it may be later than Setup 9.")
+alertcondition(buySeq.cancelEvent, "Buy Sequential Cancelled", "Unfinished Buy Sequential cancelled by an opposite Setup or its originating TDST.")
+alertcondition(sellSeq.cancelEvent, "Sell Sequential Cancelled", "Unfinished Sell Sequential cancelled by an opposite Setup or its originating TDST.")
+alertcondition(buyCombo.cancelEvent, "Buy Combo Cancelled", "Unfinished Buy Combo cancelled by an opposite Setup or its originating TDST.")
+alertcondition(sellCombo.cancelEvent, "Sell Combo Cancelled", "Unfinished Sell Combo cancelled by an opposite Setup or its originating TDST.")
+alertcondition(buySeq.recycleEvent, "Buy Sequential Recycled", "Buy Sequential recycled under the selected explicit policy.")
+alertcondition(sellSeq.recycleEvent, "Sell Sequential Recycled", "Sell Sequential recycled under the selected explicit policy.")
+alertcondition(buyCombo.recycleEvent, "Buy Combo Recycled", "Buy Combo recycled under the selected explicit policy.")
+alertcondition(sellCombo.recycleEvent, "Sell Combo Recycled", "Sell Combo recycled under the selected explicit policy.")
+alertcondition(resistanceQualifiedEvent, "TDST Resistance Qualified Break", "At least one TDST resistance retired under the selected breakout rule.")
+alertcondition(supportQualifiedEvent, "TDST Support Qualified Break", "At least one TDST support retired under the selected breakout rule.")
+alertcondition(resistanceDisqualifiedEvent, "TDST Resistance Disqualified Break", "TDST resistance penetration failed the selected filter; level retained.")
+alertcondition(supportDisqualifiedEvent, "TDST Support Disqualified Break", "TDST support penetration failed the selected filter; level retained.")
+alertcondition(barstate.isconfirmed and not buySeq.last13Recycled and not na(buySeq.last13Bar) and bar_index - buySeq.last13Bar == 12, "Buy Sequential 12-Bar Review", "Twelve bars since the latest Buy Sequential 13. Review the response; this alert does not automatically invalidate the signal.")
+alertcondition(barstate.isconfirmed and not sellSeq.last13Recycled and not na(sellSeq.last13Bar) and bar_index - sellSeq.last13Bar == 12, "Sell Sequential 12-Bar Review", "Twelve bars since the latest Sell Sequential 13. Review the response; this alert does not automatically invalidate the signal.")
+
+// ── Specification / limitations ────────────────────────────────────────────────
+// 1. All engine transitions commit on barstate.isconfirmed. Combo marks for Setup
+//    bars 1–9 are deliberately retrospective: they become valid on Setup 9.
+// 2. Completed 13s survive ordinary cancellation. A SUBSEQUENT overlapping Setup
+//    reaching 22 can relabel an older 13 as R. That change is not knowable at 13.
+//    The originating Setup reaching 22 cannot recycle its own countdown.
+// 3. One active Sequential and one active Combo per direction. This is an explicit
+//    limited series-selection policy, not licensed hidden parallel-count logic.
+//    A subsequent 22 cancels an older unfinished count; a later Setup 9 rearms it.
+//    Optional 100–200% size recycling is evaluated at new Setup 9, inclusively,
+//    against the incumbent's extended Setup envelope. No retrospective reselection.
+// 4. TDST prices use the FIRST NINE Setup bars' true extremes. Their lifetime is
+//    independent of all drawing settings. There is no age expiry or latest-only
+//    deletion of live records. Records are limited to the chart's loaded history.
+// 5. The TDST filter is the published three-alternative filter, combined with the
+//    selected confirmed-bar break basis. Exact current Symbolik qualification,
+//    every proprietary cancellation/recycling variant and feed parity are unverified.
+// 6. Live TDST presentation is reconstructed as of the rightmost viewed confirmed
+//    bar from birth/break times. The separate count/status rows show latest state.
+//    Newest eligible TDST levels are drawn first; hidden values remain in records.
+//    Unconfirmed breaks default to dotted 1 px; confirmed breaks to solid 1 px.
+//    Optional confirmed-break history ends at the break candle and is excluded
+//    from live-level counts. Its separate budget prioritises most recent breaks.
+//    TDST anchors default to the exact Setup 1 timestamp, but the first-nine-bar
+//    TDST level remains unavailable until Setup 9. Risk anchoring is unchanged.
+// 7. Zero-padding viewport mode removes OUT-OF-RANGE drawing IDs, not just colour.
+//    For 'All live levels', enable TradingView 'Scale price chart only'. Pine does
+//    not control that chart setting; scale.none is not used as an autoscale shortcut.
+// 8. Sequential risk uses the extremal TRUE low/high and that bar's own TRUE range
+//    across ALL bars from actual count 1 through accepted 13. Tie choice is explicit.
+//    Risk references do not implement qualified stop-out, position sizing or orders.
+//    A recycled 13's risk is hidden from its recycle date, with R shown in the table.
+// 9. Perfection waits without an arbitrary age expiry. All unresolved completed
+//    Setups can later perfect; multiple pending Setups may perfect on one bar.
+// 10. The original pivot-extension 'TD Propulsion' module is intentionally excluded:
+//     its ratios/anchors were not verified as official, and it leaked labels.
+// 11. Use standard OHLC candles for comparison. Different feeds, sessions, adjusted
+//     prices, loaded history, and synthetic candles can change all price-based counts.
+//
+// Primary rules:
+// https://demark.com/sequential-indicator/
+// https://help.symbolik.com/hc/en-us/articles/37782822323987-DeMARK-Sequential-Indicator
+// https://in.tradingview.com/script/gVMuxasg-DeMARK-9-13/
+// https://demark.com/wp-content/uploads/2025/07/2007-August-DeMark-Active-Trader-interview.pdf
+// https://catalogimages.wiley.com/images/db/pdf/9781576603147.excerpt.pdf
+// Jason Perl, DeMark Indicators: Sequential chapter; Combo variants described in
+// chapter 2. Current platform names are not assumed to equal historical versions.
+// Pine behaviour:
+// https://www.tradingview.com/pine-script-docs/concepts/bar-states/
+// https://www.tradingview.com/pine-script-docs/concepts/time/
+// https://www.tradingview.com/pine-script-docs/visuals/lines-and-boxes/
+// https://www.tradingview.com/support/solutions/43000762934-my-chart-looks-compressed/
