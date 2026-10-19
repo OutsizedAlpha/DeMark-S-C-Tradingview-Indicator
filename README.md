@@ -6,6 +6,12 @@
 
 > **Independent, not official.** This is not DeMARK, Symbolik, Bloomberg or TradingView licensed source, and is not certified to reproduce the current proprietary implementations. The selectable rule variants and omissions are documented below. The indicator provides analytical references, not investment advice or automatic trading orders.
 
+## Example chart — Okta (NASDAQ: OKTA)
+
+![Okta daily TradingView chart with TD Setup 9 counts, TD Sequential S13, TD Combo C13, and horizontal TDST support and resistance levels](./docs/images/okta-td-sequential-combo-tdst.png)
+
+*Daily NASDAQ:OKTA chart captured on 19 October 2026. The annotations illustrate TD Setup, Sequential, Combo and historical TDST levels, including confirmed break history. This is a historical visual example, not a trade recommendation or evidence of parity with licensed DeMARK indicators. Chart imagery © TradingView and respective data owners.*
+
 ## What it does
 
 - **TD Setup:** buy/sell price-flip detection, 1–9 counts, optional completion-only display and first-1 markers.
